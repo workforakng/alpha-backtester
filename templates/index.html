@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Alpha Backtester</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0e1a; --bg2: #111827; --bg3: #1a2235;
+    --green: #00ff88; --red: #ff4466; --yellow: #ffcc00;
+    --cyan: #00ccff; --white: #e8eaf0; --dim: #556070;
+    --border: #1e2d42; --radius: 10px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--white); font-family: 'Segoe UI', monospace; font-size: 14px; }
+  header { background: var(--bg2); border-bottom: 1px solid var(--border); padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
+  header h1 { color: var(--cyan); font-size: 20px; letter-spacing: 2px; }
+  header .badge { background: var(--bg3); border: 1px solid var(--border); border-radius: 20px; padding: 4px 14px; font-size: 12px; color: var(--dim); }
+  .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 16px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 16px; }
+  @media(max-width:900px) { .grid-3,.grid-4 { grid-template-columns: 1fr 1fr; } .grid-2 { grid-template-columns: 1fr; } }
+  @media(max-width:500px) { .grid-3,.grid-4,.grid-2 { grid-template-columns: 1fr; } }
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; }
+  .card h3 { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+  .big-num { font-size: 28px; font-weight: 700; }
+  .green { color: var(--green); }
+  .red   { color: var(--red); }
+  .yellow{ color: var(--yellow); }
+  .cyan  { color: var(--cyan); }
+  .dim   { color: var(--dim); }
+  .sub   { font-size: 12px; color: var(--dim); margin-top: 4px; }
+  /* Controls */
+  .controls { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; align-items: center; }
+  .btn { padding: 10px 22px; border-radius: 8px; border: none; cursor: pointer; font-size: 14px; font-weight: 600; transition: 0.2s; }
+  .btn-green  { background: #00c96e; color: #000; }
+  .btn-red    { background: #cc2244; color: #fff; }
+  .btn-yellow { background: #cc9900; color: #000; }
+  .btn-cyan   { background: #0099cc; color: #fff; }
+  .btn:hover  { opacity: 0.85; transform: translateY(-1px); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+  .status-bar { flex: 1; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; font-size: 13px; min-width: 200px; }
+  /* Ticker table */
+  table { width: 100%; border-collapse: collapse; }
+  th { color: var(--dim); font-size: 11px; text-transform: uppercase; padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+  td { padding: 10px 10px; border-bottom: 1px solid #151f30; font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #151f30; }
+  /* Trade log */
+  .trade-log { max-height: 340px; overflow-y: auto; }
+  .trade-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid #151f30; font-size: 12px; }
+  .trade-row:hover { background: #151f30; }
+  .tag { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+  .tag-call { background: #003322; color: var(--green); }
+  .tag-put  { background: #330011; color: var(--red); }
+  .tag-win  { background: #002211; color: var(--green); }
+  .tag-loss { background: #220011; color: var(--red); }
+  .tag-stop { background: #332200; color: var(--yellow); }
+  /* Wallet bar */
+  .wallet-bar-wrap { background: #1a2235; border-radius: 6px; height: 8px; margin-top: 10px; overflow: hidden; }
+  .wallet-bar-fill { height: 100%; border-radius: 6px; transition: width 0.4s; }
+  /* Log scroll */
+  ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-track { background: #111; } ::-webkit-scrollbar-thumb { background: #334; border-radius: 3px; }
+  /* Pulse dot */
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); margin-right: 6px; }
+  .dot.live { background: var(--green); animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  .ticker-badge { display:inline-block; background:#0d1f33; border:1px solid #1e3a5a; border-radius:4px; padding:2px 8px; font-size:11px; color:var(--cyan); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚡ ALPHA BACKTESTER</h1>
+  <div style="display:flex;gap:12px;align-items:center">
+    <span id="conn-badge" class="badge">● Connecting...</span>
+    <span class="badge">₹{{ "{:,.0f}".format(initial_wallet) }} Capital</span>
+    {% for t in tickers %}<span class="ticker-badge">{{ t }}</span>{% endfor %}
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- Controls -->
+  <div class="controls">
+    <button class="btn btn-green"  id="btn-start"   onclick="startSim(false)">▶ Run Backtest</button>
+    <button class="btn btn-cyan"   id="btn-refresh" onclick="startSim(true)" >↻ Refresh Data</button>
+    <button class="btn btn-red"    id="btn-stop"    onclick="stopSim()"  disabled>■ Stop</button>
+    <button class="btn btn-yellow" id="btn-clear"   onclick="clearData()">🗑 Clear Cache</button>
+    <div class="status-bar" id="status-bar"><span class="dot" id="live-dot"></span> Idle — press Run Backtest to start</div>
+  </div>
+
+  <!-- Wallet + Stats row -->
+  <div class="grid-4">
+    <div class="card">
+      <h3>💰 Wallet</h3>
+      <div class="big-num green" id="wallet">₹1,00,000</div>
+      <div class="sub" id="wallet-pct">+0.00%</div>
+      <div class="wallet-bar-wrap"><div class="wallet-bar-fill green" id="wallet-bar" style="width:100%;background:var(--green)"></div></div>
+    </div>
+    <div class="card">
+      <h3>📈 Net P&amp;L</h3>
+      <div class="big-num" id="net-pnl">₹0.00</div>
+      <div class="sub">Realised: <span id="realised-pnl">₹0</span></div>
+      <div class="sub">Open: <span id="open-pnl">₹0</span></div>
+    </div>
+    <div class="card">
+      <h3>🎯 Win Rate</h3>
+      <div class="big-num cyan" id="win-rate">0%</div>
+      <div class="sub">Total Trades: <span id="total-trades">0</span></div>
+    </div>
+    <div class="card">
+      <h3>⚡ Simulation</h3>
+      <div class="big-num yellow" id="tick-count">0</div>
+      <div class="sub">Ticks Processed</div>
+      <div class="sub">Elapsed: <span id="elapsed">0s</span></div>
+    </div>
+  </div>
+
+  <!-- Ticker table + Trade log -->
+  <div class="grid-2">
+    <div class="card">
+      <h3>📊 Live Ticker Stats</h3>
+      <table>
+        <thead><tr><th>Ticker</th><th>Price</th><th>Open P&L</th><th>Realised</th><th>Signal</th><th>Trades</th></tr></thead>
+        <tbody id="ticker-tbody">
+          {% for t in tickers %}
+          <tr id="row-{{ t|replace('.','_')|replace('^','IDX_') }}">
+            <td class="cyan">{{ t }}</td>
+            <td>—</td><td>—</td><td>—</td><td class="dim">—</td><td>—</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>📋 Trade Log <span class="dim" style="font-size:11px">(last 50)</span></h3>
+      <div class="trade-log" id="trade-log">
+        <div class="dim" style="padding:20px;text-align:center">No trades yet...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Summary modal (shown after sim ends) -->
+  <div id="summary-card" class="card" style="display:none;margin-bottom:16px">
+    <h3>🏁 Final Summary</h3>
+    <div class="grid-4" id="summary-grid" style="margin-top:12px;margin-bottom:0"></div>
+  </div>
+
+</div>
+
+<script>
+const socket = io();
+const fmt = v => v >= 0 ? `+₹${v.toLocaleString('en-IN',{minimumFractionDigits:2})}` : `-₹${Math.abs(v).toLocaleString('en-IN',{minimumFractionDigits:2})}`;
+const fmtW = v => `₹${v.toLocaleString('en-IN',{minimumFractionDigits:2})}`;
+
+socket.on("connect",    ()=> setBadge("● Connected","green"));
+socket.on("disconnect", ()=> setBadge("● Disconnected","red"));
+
+socket.on("status", d => {
+  const bar = document.getElementById("status-bar");
+  bar.innerHTML = `<span class="dot ${d.type==='success'?'live':''}"></span>${d.msg}`;
+  if(d.type==='success') document.getElementById("live-dot").classList.add("live");
+  else document.getElementById("live-dot").classList.remove("live");
+});
+
+socket.on("dashboard_update", d => {
+  // Wallet
+  document.getElementById("wallet").textContent = fmtW(d.wallet);
+  document.getElementById("wallet").className = `big-num ${d.net_pnl>=0?'green':'red'}`;
+  document.getElementById("wallet-pct").textContent = `${d.wallet_pct>=0?'+':''}${d.wallet_pct}%`;
+  const pct = Math.min(Math.max(d.wallet / {{ initial_wallet }} * 100, 0), 150);
+  document.getElementById("wallet-bar").style.width = Math.min(pct,100)+'%';
+  document.getElementById("wallet-bar").style.background = d.wallet >= {{ initial_wallet }} ? 'var(--green)' : 'var(--red)';
+  // P&L
+  const np = document.getElementById("net-pnl");
+  np.textContent = fmt(d.net_pnl);
+  np.className = `big-num ${d.net_pnl>=0?'green':'red'}`;
+  document.getElementById("realised-pnl").textContent = fmt(d.realised_pnl);
+  document.getElementById("open-pnl").textContent     = fmt(d.open_pnl);
+  // Stats
+  document.getElementById("win-rate").textContent    = d.win_rate + '%';
+  document.getElementById("total-trades").textContent= d.total_trades;
+  document.getElementById("tick-count").textContent  = d.tick_count.toLocaleString();
+  document.getElementById("elapsed").textContent     = d.elapsed + 's';
+  // Ticker rows
+  if(d.ticker_stats) {
+    Object.entries(d.ticker_stats).forEach(([tk, s]) => {
+      const id = 'row-' + tk.replace(/\./g,'_').replace(/\^/g,'IDX_');
+      const row = document.getElementById(id);
+      if(!row) return;
+      const cells = row.querySelectorAll('td');
+      cells[1].textContent = `₹${s.current_price.toLocaleString('en-IN',{minimumFractionDigits:2})}`;
+      cells[2].innerHTML   = `<span class="${s.open_pnl>=0?'green':'red'}">${fmt(s.open_pnl)}</span>`;
+      cells[3].innerHTML   = `<span class="${s.realised_pnl>=0?'green':'red'}">${fmt(s.realised_pnl)}</span>`;
+      cells[4].innerHTML   = `<span class="${s.last_signal.includes('▲')?'green':'red'}">${s.last_signal}</span>`;
+      cells[5].textContent = `${s.open_trades} open / ${s.closed_trades} closed`;
+    });
+  }
+});
+
+socket.on("new_trade", t => {
+  const log = document.getElementById("trade-log");
+  if(log.querySelector('.dim')) log.innerHTML = '';
+  const pnlCls = t.pnl>=0?'green':'red';
+  const dirTag = `<span class="tag ${t.direction==='CALL'?'tag-call':'tag-put'}">${t.direction==='CALL'?'▲':'▼'} ${t.direction}</span>`;
+  const stTag  = `<span class="tag ${t.status==='WIN'?'tag-win':t.status==='STOPPED'?'tag-stop':'tag-loss'}">${t.status}</span>`;
+  const row = document.createElement('div');
+  row.className = 'trade-row';
+  row.innerHTML = `${dirTag}<span class="cyan">${t.ticker}</span><span class="dim">${t.entry} → ${t.exit}</span><span class="${pnlCls}" style="margin-left:auto">${fmt(t.pnl)}</span>${stTag}<span class="dim">${t.time}</span>`;
+  log.prepend(row);
+  while(log.children.length > 50) log.removeChild(log.lastChild);
+});
+
+socket.on("sim_done", s => {
+  document.getElementById("btn-start").disabled   = false;
+  document.getElementById("btn-refresh").disabled = false;
+  document.getElementById("btn-stop").disabled    = true;
+  document.getElementById("live-dot").classList.remove("live");
+  const sc = document.getElementById("summary-card");
+  sc.style.display = 'block';
+  document.getElementById("summary-grid").innerHTML = `
+    <div class="card"><h3>Total Trades</h3><div class="big-num cyan">${s.total}</div></div>
+    <div class="card"><h3>Win Rate</h3><div class="big-num ${s.win_rate>=50?'green':'red'}">${s.win_rate}%</div><div class="sub">W:${s.wins} L:${s.losses}</div></div>
+    <div class="card"><h3>Net P&L</h3><div class="big-num ${s.net_pnl>=0?'green':'red'}">${fmt(s.net_pnl)}</div></div>
+    <div class="card"><h3>Avg Win / Loss</h3><div class="sub green">Win: ${fmt(s.avg_win)}</div><div class="sub red">Loss: ${fmt(s.avg_loss)}</div></div>
+  `;
+});
+
+function setBadge(text, color) {
+  const b = document.getElementById("conn-badge");
+  b.textContent = text;
+  b.style.color = color==='green'?'var(--green)':'var(--red)';
+}
+
+function startSim(force) {
+  document.getElementById("summary-card").style.display = 'none';
+  document.getElementById("btn-start").disabled   = true;
+  document.getElementById("btn-refresh").disabled = true;
+  document.getElementById("btn-stop").disabled    = false;
+  document.getElementById("trade-log").innerHTML  = '<div class="dim" style="padding:20px;text-align:center">Waiting for trades...</div>';
+  socket.emit("start_sim", {force_refresh: force});
+}
+function stopSim()   { socket.emit("stop_sim"); }
+function clearData() { socket.emit("clear_data"); }
+</script>
+</body>
+</html>
