@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, List
@@ -9,14 +10,17 @@ from typing import Optional, List
 from indicators import compute_indicators, get_latest_signals
 from engine import (
     TradeRecord, get_option_premium,
-    calculate_position_size, candle_stream,
+    calculate_position_size,
     compute_metrics,
 )
 from config import (
-    MAX_CONCURRENT_TRADES, TICKS_PER_CANDLE,
+    MAX_CONCURRENT_TRADES,
     MAX_DRAWDOWN_PCT, COOLDOWN_CANDLES,
-    MAX_TRADES_PER_TICKER, REGIME_FILTER_ENABLED, ADX_THRESHOLD,
+    MAX_TRADES_PER_TICKER, REGIME_FILTER_ENABLED,
+    SLIPPAGE_PCT, BROKERAGE_PCT,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────── SIGNAL RESULT ─────────────────────────────
@@ -213,6 +217,10 @@ class TickerStrategy:
         qty        = calculate_position_size(wallet, spot, premium, wr, aw, al)
         cost       = (premium + spot * SLIPPAGE_PCT + premium * BROKERAGE_PCT) * qty
         if qty <= 0 or cost > wallet * 0.20:
+            logger.debug(
+                "Trade rejected for %s: dir=%s qty=%s cost=%.2f wallet=%.2f premium=%.2f atr=%.4f wr=%.2f",
+                self.ticker, direction, qty, cost, wallet, premium, atr, wr,
+            )
             return None
         trade = TradeRecord(
             ticker=self.ticker, direction=direction,
@@ -220,6 +228,10 @@ class TickerStrategy:
             qty=qty, entry_time=ts, atr=atr,
         )
         self.open_trades.append(trade)
+        logger.debug(
+            "Trade opened for %s: dir=%s qty=%s spot=%.2f premium=%.2f cost=%.2f signal_atr=%.4f",
+            self.ticker, direction, qty, spot, premium, trade.cost_basis(), atr,
+        )
         return trade
 
     def _check_exits(self, spot: float, ts, signal: SignalResult) -> List[TradeRecord]:
@@ -238,6 +250,10 @@ class TickerStrategy:
                 t.close(spot, ts, reason)
                 self.closed_trades.append(t)
                 self._recent_pnls.append(t.pnl)
+                logger.debug(
+                    "Trade closed for %s: dir=%s reason=%s pnl=%.2f spot=%.2f qty=%s",
+                    self.ticker, t.direction, reason, t.pnl, spot, t.qty,
+                )
                 if reason in ("trailing_stop", "atr_stop", "hard_stop"):
                     self._cooldown = COOLDOWN_CANDLES
                 exited.append(t)
@@ -274,6 +290,10 @@ class TickerStrategy:
         if portfolio_peak > 0:
             dd = (portfolio_peak - wallet) / portfolio_peak
             if dd > MAX_DRAWDOWN_PCT:
+                logger.warning(
+                    "Portfolio drawdown guard active for %s: wallet=%.2f peak=%.2f drawdown=%.4f",
+                    self.ticker, wallet, portfolio_peak, dd,
+                )
                 return new_trades, closed, signal   # halt: drawdown breached
 
         if (signal.direction
@@ -287,12 +307,22 @@ class TickerStrategy:
                 if t:
                     new_trades.append(t)
 
+        if signal.direction and (new_trades or closed):
+            logger.debug(
+                "Signal processed for %s: candle=%s dir=%s strength=%s score=%.1f/%s open=%s closed=%s wallet=%.2f",
+                self.ticker, candle_idx, signal.direction, signal.strength,
+                signal.score, signal.max_score, len(self.open_trades), len(closed), wallet,
+            )
+
         return new_trades, closed, signal
 
     # ── reporting
 
     def get_open_pnl(self, price: float) -> float:
         return sum(t.compute_pnl(price) for t in self.open_trades)
+
+    def get_open_cost_basis(self) -> float:
+        return sum(t.cost_basis() for t in self.open_trades)
 
     def get_total_realised_pnl(self) -> float:
         return sum(t.pnl for t in self.closed_trades)

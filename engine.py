@@ -109,6 +109,11 @@ def interpolate_candle_ticks(
 def candle_stream(
     df: pd.DataFrame, n_ticks: int = TICKS_PER_CANDLE
 ) -> Generator[Tuple[pd.Timestamp, float, int], None, None]:
+    if len(df.index) >= 2:
+        inferred_step_ns = max(int((pd.Timestamp(df.index[1]) - pd.Timestamp(df.index[0])).value), int(1e9))
+    else:
+        inferred_step_ns = int(60e9)
+
     for i, (ts, row) in enumerate(df.iterrows()):
         ticks = interpolate_candle_ticks(
             open_=float(row["Open"]), high=float(row["High"]),
@@ -116,7 +121,7 @@ def candle_stream(
             n_ticks=n_ticks,
         )
         candle_start_ns = pd.Timestamp(ts).value
-        candle_end_ns   = candle_start_ns + int(60e9)
+        candle_end_ns   = candle_start_ns + inferred_step_ns
         tick_times      = np.linspace(candle_start_ns, candle_end_ns, n_ticks, endpoint=False)
         for j, (tick_ns, price) in enumerate(zip(tick_times, ticks)):
             yield pd.Timestamp(tick_ns, unit="ns", tz="UTC"), float(price), i

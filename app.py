@@ -2,6 +2,7 @@ import os
 import json
 import threading
 import time
+import logging
 import numpy as np
 import pandas as pd
 from flask import Flask, render_template, jsonify, request
@@ -11,6 +12,12 @@ from config import INITIAL_WALLET, TICKS_PER_CANDLE, TICKERS
 from data_manager import load_all_tickers, clear_old_data
 from strategy import TickerStrategy
 from engine import candle_stream
+
+logging.basicConfig(
+    level=os.environ.get("ALPHA_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "alpha_backtester_secret")
@@ -51,7 +58,7 @@ def _run_simulation(params):
     force_refresh  = params.get("force_refresh", False)
     custom_tickers = params.get("tickers", TICKERS)
     initial_wallet = float(params.get("wallet", INITIAL_WALLET))
-    speed          = int(params.get("speed", 1))   # 1/10/50/100
+    speed          = max(1, int(params.get("speed", 1)))   # 1/10/50/100
     period         = params.get("period", "5d")
     interval       = params.get("interval", "1m")
 
@@ -67,6 +74,10 @@ def _run_simulation(params):
         tickers=custom_tickers,
         period=period,
         interval=interval,
+    )
+    logger.info(
+        "Web simulation requested: tickers=%s wallet=%.2f speed=%s period=%s interval=%s",
+        custom_tickers, initial_wallet, speed, period, interval,
     )
     if not all_data:
         socketio.emit("status", {"msg": "❌ No data loaded. Check tickers/date range.", "type": "error"})
@@ -89,6 +100,7 @@ def _run_simulation(params):
     strategies     = {t: TickerStrategy(t, df) for t, df in all_data.items()}
     current_prices = {t: float(df["Close"].iloc[-1]) for t, df in all_data.items()}
     wallet         = float(initial_wallet)
+    portfolio_peak = wallet
 
     iterators = {t: iter(candle_stream(df, TICKS_PER_CANDLE)) for t, df in all_data.items()}
     active    = set(iterators.keys())
@@ -110,13 +122,21 @@ def _run_simulation(params):
 
             current_prices[ticker] = price
             strat  = strategies[ticker]
-            new_t, closed_t, signal = strat.process_tick(ts, price, candle_idx, wallet)
+            new_t, closed_t, signal = strat.process_tick(ts, price, candle_idx, wallet, portfolio_peak)
 
             for trade in new_t:
                 wallet -= trade.cost_basis()
+                logger.debug(
+                    "Web wallet debit: ticker=%s dir=%s cost=%.2f wallet=%.2f",
+                    trade.ticker, trade.direction, trade.cost_basis(), wallet,
+                )
 
             for trade in closed_t:
                 wallet += trade.cost_basis() + trade.pnl
+                logger.debug(
+                    "Web wallet credit: ticker=%s reason=%s credit=%.2f pnl=%.2f wallet=%.2f",
+                    trade.ticker, trade.exit_reason, trade.cost_basis() + trade.pnl, trade.pnl, wallet,
+                )
                 log_entry = {
                     "ticker":    trade.ticker,
                     "direction": trade.direction,
@@ -147,12 +167,18 @@ def _run_simulation(params):
             sim_state["tick_count"] += 1
             sim_state["wallet"]      = wallet
             tick_batch              += 1
+            portfolio_equity = wallet + sum(s.get_open_cost_basis() + s.get_open_pnl(current_prices.get(tk, 0.0)) for tk, s in strategies.items())
+            portfolio_peak = max(portfolio_peak, portfolio_equity)
 
             # equity curve sample
             if sim_state["tick_count"] % equity_every == 0:
+                equity_value = wallet + sum(
+                    s.get_open_cost_basis() + s.get_open_pnl(current_prices.get(tk, 0.0))
+                    for tk, s in strategies.items()
+                )
                 sim_state["equity_curve"].append({
                     "t": sim_state["tick_count"],
-                    "v": round(wallet, 2)
+                    "v": round(equity_value, 2)
                 })
 
             if tick_batch >= speed:
@@ -168,6 +194,12 @@ def _run_simulation(params):
     # Recalculate wallet from all realised PnL
     total_realised = sum(t.pnl for s in strategies.values() for t in s.closed_trades)
     wallet = initial_wallet + total_realised
+    logger.info(
+        "Web wallet reconciled: initial=%.2f closed_trades=%s final=%.2f",
+        initial_wallet,
+        sum(len(s.closed_trades) for s in strategies.values()),
+        wallet,
+    )
 
     sim_state["running"] = False
     sim_state["wallet"]  = wallet
@@ -199,6 +231,7 @@ def _run_multi_wallet_comparison(params):
         strategies = {t: TickerStrategy(t, df) for t, df in all_data.items()}
         current_prices = {t: float(df["Close"].iloc[-1]) for t, df in all_data.items()}
         wallet = float(wallet_size)
+        portfolio_peak = wallet
         iterators = {t: iter(candle_stream(df, TICKS_PER_CANDLE)) for t, df in all_data.items()}
         active = set(iterators.keys())
 
@@ -213,9 +246,11 @@ def _run_multi_wallet_comparison(params):
                     continue
                 current_prices[ticker] = price
                 strat = strategies[ticker]
-                new_t, closed_t, signal = strat.process_tick(ts, price, candle_idx, wallet)
+                new_t, closed_t, signal = strat.process_tick(ts, price, candle_idx, wallet, portfolio_peak)
                 for t in new_t: wallet -= t.cost_basis()
                 for t in closed_t: wallet += t.cost_basis() + t.pnl
+                portfolio_equity = wallet + sum(s.get_open_cost_basis() + s.get_open_pnl(current_prices.get(tk, 0.0)) for tk, s in strategies.items())
+                portfolio_peak = max(portfolio_peak, portfolio_equity)
             import eventlet; eventlet.sleep(0)
 
         for ticker, strat in strategies.items():
@@ -247,15 +282,17 @@ def _emit_dashboard(strategies, current_prices, wallet, initial_wallet):
     wins       = [t for t in all_closed if t.status == "WIN"]
     total_pnl  = sum(t.pnl for t in all_closed)
     open_pnl   = sum(s.get_open_pnl(current_prices.get(tk, 0)) for tk, s in strategies.items())
+    open_cost  = sum(s.get_open_cost_basis() for s in strategies.values())
     elapsed    = round(time.time() - sim_state["start_time"], 1) if sim_state["start_time"] else 0
 
     socketio.emit("dashboard_update", {
         "wallet":        round(wallet, 2),
+        "equity":        round(wallet + open_cost + open_pnl, 2),
         "initial_wallet": initial_wallet,
         "net_pnl":       round(total_pnl + open_pnl, 2),
         "realised_pnl":  round(total_pnl, 2),
         "open_pnl":      round(open_pnl, 2),
-        "wallet_pct":    round(((wallet - initial_wallet) / initial_wallet) * 100, 2),
+        "wallet_pct":    round((((wallet + open_cost + open_pnl) - initial_wallet) / initial_wallet) * 100, 2),
         "tick_count":    sim_state["tick_count"],
         "win_rate":      round(len(wins) / max(len(all_closed), 1) * 100, 1),
         "total_trades":  len(all_closed),
@@ -328,6 +365,7 @@ def handle_connect():
     if sim_state["ticker_stats"]:
         emit("dashboard_update", {
             "wallet":         round(sim_state["wallet"], 2),
+            "equity":         round(sim_state["wallet"], 2),
             "initial_wallet": INITIAL_WALLET,
             "net_pnl":        0, "realised_pnl": 0, "open_pnl": 0,
             "wallet_pct":     0, "tick_count":   sim_state["tick_count"],

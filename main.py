@@ -5,6 +5,7 @@ import sys
 import time
 import signal
 import textwrap
+import logging
 from datetime import datetime
 from collections import defaultdict
 
@@ -13,11 +14,17 @@ import numpy as np
 
 from config import (
     INITIAL_WALLET, SIMULATION_DELAY_MS, TICKS_PER_CANDLE,
-    DASHBOARD_REFRESH_ROWS, TRADE_LOG_SIZE, TICKERS
+    TRADE_LOG_SIZE, TICKERS
 )
 from data_manager import load_all_tickers, clear_old_data, get_data_summary
 from strategy import TickerStrategy
 from engine import candle_stream
+
+logging.basicConfig(
+    level=os.environ.get("ALPHA_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # ── ANSI Color Codes ──────────────────────────────────────────────────────────
 GREEN  = "\033[92m"
@@ -63,6 +70,7 @@ class Dashboard:
 
     def render(self, wallet, strategies, current_prices):
         total_open_pnl    = 0.0
+        total_open_cost   = 0.0
         total_realised    = 0.0
         open_trade_count  = 0
         closed_trade_count= 0
@@ -71,8 +79,10 @@ class Dashboard:
         for ticker, strat in strategies.items():
             price = current_prices.get(ticker, 0.0)
             open_pnl = strat.get_open_pnl(price)
+            open_cost = strat.get_open_cost_basis()
             real_pnl = strat.get_total_realised_pnl()
             total_open_pnl   += open_pnl
+            total_open_cost  += open_cost
             total_realised   += real_pnl
             open_trade_count += len(strat.open_trades)
             closed_trade_count += len(strat.closed_trades)
@@ -90,7 +100,7 @@ class Dashboard:
             )
 
         net_pnl      = total_realised + total_open_pnl
-        wallet_now   = wallet + total_open_pnl
+        wallet_now   = wallet + total_open_cost + total_open_pnl
         wallet_pct   = (net_pnl / INITIAL_WALLET) * 100
         elapsed      = time.time() - self.start_time
 
@@ -149,11 +159,13 @@ def run_simulation(force_refresh: bool = False):
         sys.exit(1)
 
     print(get_data_summary(all_data))
+    logger.info("Loaded %s tickers for CLI simulation", len(all_data))
 
     wallet      = float(INITIAL_WALLET)
     strategies  = {ticker: TickerStrategy(ticker, df) for ticker, df in all_data.items()}
     dashboard   = Dashboard(list(strategies.keys()))
     current_prices = {t: float(df["Close"].iloc[-1]) for t, df in all_data.items()}
+    portfolio_peak = wallet
 
     # Build unified tick stream (sorted by timestamp)
     tick_streams = {}
@@ -181,8 +193,8 @@ def run_simulation(force_refresh: bool = False):
                 except StopIteration:
                     # Force-close any remaining open positions
                     strategies[ticker].force_close_all(
-                        current_prices.get(ticker, price),
-                        ts
+                        current_prices.get(ticker, 0.0),
+                        pd.Timestamp.now(tz="UTC")
                     )
                     active.discard(ticker)
                     continue
@@ -191,18 +203,28 @@ def run_simulation(force_refresh: bool = False):
                 strat = strategies[ticker]
 
                 new_trades, closed_trades, signal = strat.process_tick(
-                    ts, price, candle_idx, wallet
+                    ts, price, candle_idx, wallet, portfolio_peak
                 )
 
                 # Adjust wallet for trade costs and P&L
                 for trade in new_trades:
                     wallet -= trade.cost_basis()
+                    logger.debug(
+                        "CLI wallet debit: ticker=%s dir=%s cost=%.2f wallet=%.2f",
+                        trade.ticker, trade.direction, trade.cost_basis(), wallet,
+                    )
 
                 for trade in closed_trades:
                     wallet += trade.cost_basis() + trade.pnl
                     dashboard.trade_log.append(trade)
+                    logger.debug(
+                        "CLI wallet credit: ticker=%s reason=%s credit=%.2f pnl=%.2f wallet=%.2f",
+                        trade.ticker, trade.exit_reason, trade.cost_basis() + trade.pnl, trade.pnl, wallet,
+                    )
 
                 dashboard.tick_count += 1
+                portfolio_equity = wallet + sum(s.get_open_cost_basis() + s.get_open_pnl(current_prices.get(tk, 0.0)) for tk, s in strategies.items())
+                portfolio_peak = max(portfolio_peak, portfolio_equity)
 
                 if dashboard.tick_count % render_every == 0:
                     dashboard.render(wallet, strategies, current_prices)
@@ -215,11 +237,18 @@ def run_simulation(force_refresh: bool = False):
 
     # Final close of all open trades
     for ticker, strat in strategies.items():
+        closed_before = len(strat.closed_trades)
         strat.force_close_all(current_prices.get(ticker, 0), pd.Timestamp.now(tz="UTC"))
-        for t in strat.closed_trades:
+        for t in strat.closed_trades[closed_before:]:
             if t not in dashboard.trade_log:
                 dashboard.trade_log.append(t)
-        wallet += strat.get_total_realised_pnl()
+
+    all_closed = [t for s in strategies.values() for t in s.closed_trades]
+    wallet = INITIAL_WALLET + sum(t.pnl for t in all_closed)
+    logger.info(
+        "CLI wallet reconciled: initial=%.2f closed_trades=%s final=%.2f",
+        INITIAL_WALLET, len(all_closed), wallet,
+    )
 
     dashboard.render(wallet, strategies, current_prices)
     _print_final_report(wallet, strategies, dashboard)

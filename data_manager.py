@@ -1,10 +1,12 @@
 import os
 import time
+import logging
 import pandas as pd
 import yfinance as yf
 from config import DATA_DIR, STALE_HOURS, TICKERS, DATA_INTERVAL, DATA_PERIOD
 
 os.makedirs(DATA_DIR, exist_ok=True)
+logger = logging.getLogger(__name__)
 
 
 def _cache_path(ticker, period, interval):
@@ -25,6 +27,7 @@ def load_ticker(ticker, force_refresh=False, period=DATA_PERIOD, interval=DATA_I
         try:
             df = pd.read_csv(path, index_col=0, parse_dates=True)
             if len(df) > 10:
+                logger.debug("Loaded %s from cache: rows=%s period=%s interval=%s", ticker, len(df), period, interval)
                 return df
         except Exception:
             pass
@@ -42,6 +45,7 @@ def load_ticker(ticker, force_refresh=False, period=DATA_PERIOD, interval=DATA_I
         if len(df) < 30:
             return None
         df.to_csv(path)
+        logger.debug("Downloaded %s from yfinance: rows=%s period=%s interval=%s", ticker, len(df), period, interval)
         return df
     except Exception as e:
         print(f"[data_manager] Error loading {ticker}: {e}")
@@ -68,3 +72,16 @@ def clear_old_data():
     for f in os.listdir(DATA_DIR):
         if f.endswith(".csv"):
             os.remove(os.path.join(DATA_DIR, f))
+
+
+def get_data_summary(all_data):
+    if not all_data:
+        return "[data_manager] No market data loaded."
+    lines = ["\n[data_manager] Market data summary"]
+    for ticker, df in all_data.items():
+        start = pd.Timestamp(df.index.min())
+        end = pd.Timestamp(df.index.max())
+        lines.append(
+            f"  - {ticker:<12} rows={len(df):>5} start={start} end={end} close={float(df['Close'].iloc[-1]):,.2f}"
+        )
+    return "\n".join(lines)

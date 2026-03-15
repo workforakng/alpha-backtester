@@ -89,7 +89,7 @@ def _adx(df, period=14):
     down = -low.diff()
     plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    atr14  = pd.Series(plus_dm, index=df.index).rolling(period).sum()
+    atr14  = pd.Series(tr, index=df.index).rolling(period).sum()
     pdm14  = pd.Series(plus_dm,  index=df.index).rolling(period).sum()
     mdm14  = pd.Series(minus_dm, index=df.index).rolling(period).sum()
     pdi    = 100 * pdm14  / (atr14 + 1e-9)
@@ -204,8 +204,14 @@ def get_latest_signals(df: pd.DataFrame) -> dict:
     prev = df.iloc[-2]
     c    = float(r["Close"])
 
-    def f(col):  return float(r.get(col,   np.nan) or 0)
-    def fp(col): return float(prev.get(col, np.nan) or 0)
+    def _safe_float(value):
+        return 0.0 if pd.isna(value) else float(value)
+
+    def f(col):
+        return _safe_float(r.get(col, np.nan))
+
+    def fp(col):
+        return _safe_float(prev.get(col, np.nan))
 
     rsi_val   = f("rsi")
     cci_val   = f("cci")

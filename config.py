@@ -86,5 +86,7 @@ DATA_DIR         = "data"
 STALE_HOURS      = 6
 
 # ── Simulation
+SIMULATION_DELAY_MS = 0
+TRADE_LOG_SIZE      = 12
 TICKS_PER_CANDLE = 60
 GBM_SIGMA_SCALE  = 0.3
