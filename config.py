@@ -1,5 +1,3 @@
-# config.py — Central configuration
-
 TICKERS = ["RELIANCE.NS", "TCS.NS", "^NSEI"]
 
 INITIAL_WALLET        = 100_000.0
@@ -16,19 +14,40 @@ IMPLIED_VOLATILITY    = 0.20
 
 TRAILING_STOP_PCT     = 0.012
 
-MACD_FAST     = 12
-MACD_SLOW     = 26
-MACD_SIGNAL   = 9
+# MACD
+MACD_FAST    = 12
+MACD_SLOW    = 26
+MACD_SIGNAL  = 9
+
+# Supertrend
 SUPERTREND_PERIOD = 10
 SUPERTREND_MULT   = 3.0
-SMA_PERIOD    = 200
-EMA_FAST      = 20
-EMA_SLOW      = 50
 
-DATA_INTERVAL = "1m"
-DATA_PERIOD   = "5d"
-DATA_DIR      = "data"
-STALE_HOURS   = 6
+# Moving Averages
+SMA_50   = 50
+SMA_100  = 100
+SMA_200  = 200
+EMA_15   = 15
+EMA_19   = 19
+EMA_20   = 20
+EMA_50   = 50
 
-TICKS_PER_CANDLE  = 60
-GBM_SIGMA_SCALE   = 0.3
+# RSI
+RSI_PERIOD     = 14
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD   = 30
+
+# Bollinger Bands
+BB_PERIOD = 20
+BB_STD    = 2.0
+
+# VWAP
+VWAP_ENABLED = True
+
+DATA_INTERVAL    = "1m"
+DATA_PERIOD      = "5d"
+DATA_DIR         = "data"
+STALE_HOURS      = 6
+
+TICKS_PER_CANDLE = 60
+GBM_SIGMA_SCALE  = 0.3

@@ -1,202 +1,197 @@
-# strategy.py — Confluence signal engine for CALL/PUT trade generation
-
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional, List
 from indicators import compute_indicators, get_latest_signals
-from engine import (
-    TradeRecord, get_option_premium,
-    calculate_position_size, candle_stream
-)
-from config import (
-    MAX_CONCURRENT_TRADES, TICKS_PER_CANDLE,
-    TRAILING_STOP_PCT
-)
+from engine import TradeRecord, get_option_premium, calculate_position_size, candle_stream
+from config import MAX_CONCURRENT_TRADES, TICKS_PER_CANDLE
 
 
 @dataclass
 class SignalResult:
-    direction: Optional[str]   # "CALL", "PUT", or None
-    score: int                 # Confluence score (0-4)
+    direction: Optional[str]
+    score: float
+    max_score: float
+    strength: str
     reasons: List[str] = field(default_factory=list)
 
 
-def evaluate_confluence(signals: dict) -> SignalResult:
+def evaluate_confluence(s: dict) -> SignalResult:
     """
-    Score system — 4 indicators, each contributes 1 point:
-      1. MACD crossover (bullish/bearish)
-      2. Supertrend direction
-      3. Price vs 200 SMA
-      4. EMA 20/50 crossover
-
-    CALL: score >= 3 all bullish
-    PUT:  score >= 3 all bearish
+    19-signal confluence engine. Min 60% score required to trade.
+    Max possible score = 23 points.
     """
-    bullish_score = 0
-    bearish_score = 0
-    reasons_bull  = []
-    reasons_bear  = []
+    bull = 0.0
+    bear = 0.0
+    rb = []
+    rs = []
 
-    # 1. MACD
-    if signals.get("macd_cross_up"):
-        bullish_score += 1
-        reasons_bull.append("MACD✅")
-    elif signals.get("macd_cross_dn"):
-        bearish_score += 1
-        reasons_bear.append("MACD✅")
+    # 1. MACD crossover (2) + histogram (1)
+    if s.get("macd_cross_up"):
+        bull += 2; rb.append("MACD\u2705cross")
+    elif s.get("macd_cross_dn"):
+        bear += 2; rs.append("MACD\u2705cross")
+    if s.get("macd_bull"):
+        bull += 1; rb.append("MACD+hist")
     else:
-        # Non-crossover: use histogram direction
-        hist = signals.get("macd_hist", 0) or 0
-        if hist > 0:
-            bullish_score += 0.5
-            reasons_bull.append("MACD~")
-        elif hist < 0:
-            bearish_score += 0.5
-            reasons_bear.append("MACD~")
+        bear += 1; rs.append("MACD-hist")
 
-    # 2. Supertrend
-    if signals.get("st_bullish"):
-        bullish_score += 1
-        reasons_bull.append("ST✅")
+    # 2. Supertrend (2)
+    if s.get("st_bullish"):
+        bull += 2; rb.append("ST\u2705bull")
     else:
-        bearish_score += 1
-        reasons_bear.append("ST✅")
+        bear += 2; rs.append("ST\u2705bear")
 
-    # 3. Price vs 200 SMA
-    if signals.get("above_sma200"):
-        bullish_score += 1
-        reasons_bull.append("SMA200✅")
+    # 3. SMA 50(1) 100(1) 200(2) + golden cross state(1) + trigger(1)
+    if s.get("above_sma50"):
+        bull += 1; rb.append("\u25b2SMA50")
     else:
-        bearish_score += 1
-        reasons_bear.append("SMA200✅")
-
-    # 4. EMA 20/50 crossover or relative position
-    if signals.get("ema_cross_up"):
-        bullish_score += 1
-        reasons_bull.append("EMA✅")
-    elif signals.get("ema_cross_dn"):
-        bearish_score += 1
-        reasons_bear.append("EMA✅")
+        bear += 1; rs.append("\u25bcSMA50")
+    if s.get("above_sma100"):
+        bull += 1; rb.append("\u25b2SMA100")
     else:
-        ema20 = signals.get("ema20", 0) or 0
-        ema50 = signals.get("ema50", 0) or 0
-        if ema20 > ema50:
-            bullish_score += 0.5
-            reasons_bull.append("EMA~")
-        elif ema20 < ema50:
-            bearish_score += 0.5
-            reasons_bear.append("EMA~")
+        bear += 1; rs.append("\u25bcSMA100")
+    if s.get("above_sma200"):
+        bull += 2; rb.append("\u25b2SMA200")
+    else:
+        bear += 2; rs.append("\u25bcSMA200")
+    if s.get("sma50_above_sma200"):
+        bull += 1; rb.append("GoldenX-state")
+    else:
+        bear += 1; rs.append("DeathX-state")
+    if s.get("sma50_cross_sma200"):
+        bull += 1; rb.append("GoldenX\u2705trigger")
 
-    if bullish_score >= 3 and bullish_score > bearish_score:
-        return SignalResult("CALL", int(bullish_score), reasons_bull)
-    elif bearish_score >= 3 and bearish_score > bullish_score:
-        return SignalResult("PUT", int(bearish_score), reasons_bear)
-    return SignalResult(None, max(int(bullish_score), int(bearish_score)), [])
+    # 4. EMA 15/19 cross (2)
+    if s.get("ema15_cross_up"):
+        bull += 2; rb.append("EMA15/19\u2705up")
+    elif s.get("ema15_cross_dn"):
+        bear += 2; rs.append("EMA15/19\u2705dn")
+
+    # 5. EMA 20/50 cross (2)
+    if s.get("ema20_cross_up"):
+        bull += 2; rb.append("EMA20/50\u2705up")
+    elif s.get("ema20_cross_dn"):
+        bear += 2; rs.append("EMA20/50\u2705dn")
+
+    # 6. EMA19 vs EMA50 state (1)
+    if s.get("ema19_above_ema50"):
+        bull += 1; rb.append("EMA19\u25b2EMA50")
+    else:
+        bear += 1; rs.append("EMA19\u25bcEMA50")
+
+    # 7. RSI extreme (2) + zone (1)
+    if s.get("rsi_oversold"):
+        bull += 2; rb.append(f"RSI\u2705oversold({s.get('rsi',0):.0f})")
+    elif s.get("rsi_overbought"):
+        bear += 2; rs.append(f"RSI\u2705overbought({s.get('rsi',0):.0f})")
+    if s.get("rsi_bull"):
+        bull += 1; rb.append("RSI-zone-bull")
+    elif s.get("rsi_bear"):
+        bear += 1; rs.append("RSI-zone-bear")
+
+    # 8. Bollinger touch (2) + squeeze (1)
+    if s.get("at_bb_lower"):
+        bull += 2; rb.append("BB\u2705lower")
+    elif s.get("at_bb_upper"):
+        bear += 2; rs.append("BB\u2705upper")
+    if s.get("bb_squeeze"):
+        if s.get("macd_bull"):
+            bull += 1; rb.append("BB-squeeze-bull")
+        else:
+            bear += 1; rs.append("BB-squeeze-bear")
+
+    # 9. VWAP (2)
+    if s.get("above_vwap"):
+        bull += 2; rb.append("\u25b2VWAP")
+    else:
+        bear += 2; rs.append("\u25bcVWAP")
+
+    max_score = 23.0
+    threshold = max_score * 0.60
+
+    def strength(score):
+        pct = score / max_score
+        if pct >= 0.80: return "STRONG"
+        if pct >= 0.65: return "MODERATE"
+        return "WEAK"
+
+    if bull >= threshold and bull > bear:
+        return SignalResult("CALL", bull, max_score, strength(bull), rb)
+    elif bear >= threshold and bear > bull:
+        return SignalResult("PUT", bear, max_score, strength(bear), rs)
+    return SignalResult(None, max(bull, bear), max_score, "WEAK", [])
 
 
 class TickerStrategy:
-    """Stateful per-ticker strategy runner."""
-
-    def __init__(self, ticker: str, df: pd.DataFrame):
-        self.ticker      = ticker
-        self.raw_df      = df
-        self.indicator_df = compute_indicators(df)
-        self.open_trades: List[TradeRecord] = []
+    def __init__(self, ticker, df):
+        self.ticker        = ticker
+        self.raw_df        = df
+        self.indicator_df  = compute_indicators(df)
+        self.open_trades: List[TradeRecord]   = []
         self.closed_trades: List[TradeRecord] = []
-        self.candle_idx  = 0          # tracks current candle for rolling indicators
 
-    def _rolling_signals(self, up_to_candle: int) -> dict:
-        """Compute signals using data up to a rolling candle index."""
-        sub = self.indicator_df.iloc[: up_to_candle + 1]
-        if len(sub) < 2:
-            return {}
-        return get_latest_signals(sub)
+    def _rolling_signals(self, up_to):
+        sub = self.indicator_df.iloc[:up_to + 1]
+        return get_latest_signals(sub) if len(sub) >= 3 else {}
 
-    def _can_open_trade(self) -> bool:
+    def _can_open(self):
         return len(self.open_trades) < MAX_CONCURRENT_TRADES
 
-    def _open_trade(self, direction: str, spot: float, timestamp, wallet: float) -> Optional[TradeRecord]:
+    def _open_trade(self, direction, spot, ts, wallet):
         premium = get_option_premium(spot, direction.lower())
         qty     = calculate_position_size(wallet, spot, premium)
         if qty <= 0 or premium * qty > wallet * 0.25:
             return None
-        trade = TradeRecord(
-            ticker=self.ticker,
-            direction=direction,
-            entry_price=spot,
-            premium=premium,
-            qty=qty,
-            entry_time=timestamp,
-        )
+        trade = TradeRecord(ticker=self.ticker, direction=direction,
+                            entry_price=spot, premium=premium,
+                            qty=qty, entry_time=ts)
         self.open_trades.append(trade)
         return trade
 
-    def _check_exits(self, spot: float, timestamp, signal: SignalResult):
-        """Check all open trades for trailing stop or opposite signal exit."""
+    def _check_exits(self, spot, ts, signal):
         exited = []
-        for trade in self.open_trades:
-            current_pnl = trade.compute_pnl(spot)
-            trade.update_trailing_stop(current_pnl)
-
-            should_exit = False
-            reason      = "signal"
-
-            if trade.is_stopped(current_pnl):
-                should_exit = True
+        for t in self.open_trades:
+            pnl = t.compute_pnl(spot)
+            t.update_trailing_stop(pnl)
+            reason = None
+            if t.is_stopped(pnl):
                 reason = "trailing_stop"
-            elif trade.direction == "CALL" and signal.direction == "PUT":
-                should_exit = True
-            elif trade.direction == "PUT" and signal.direction == "CALL":
-                should_exit = True
-
-            if should_exit:
-                trade.close(spot, timestamp, reason)
-                self.closed_trades.append(trade)
-                exited.append(trade)
-
+            elif t.direction == "CALL" and signal.direction == "PUT":
+                reason = "signal_flip"
+            elif t.direction == "PUT" and signal.direction == "CALL":
+                reason = "signal_flip"
+            if reason:
+                t.close(spot, ts, reason)
+                self.closed_trades.append(t)
+                exited.append(t)
         for t in exited:
             self.open_trades.remove(t)
         return exited
 
-    def process_tick(
-        self,
-        timestamp,
-        price: float,
-        candle_idx: int,
-        wallet: float,
-    ):
-        """
-        Main tick processor. Returns (new_trades, closed_trades, signal).
-        """
-        self.candle_idx = candle_idx
+    def process_tick(self, ts, price, candle_idx, wallet):
         signals = self._rolling_signals(candle_idx)
         if not signals:
             return [], [], None
-
-        signal = evaluate_confluence(signals)
-        closed = self._check_exits(price, timestamp, signal)
-
+        signal  = evaluate_confluence(signals)
+        closed  = self._check_exits(price, ts, signal)
         new_trades = []
-        if signal.direction and self._can_open_trade():
-            # Avoid duplicate direction in open trades
-            existing_dirs = {t.direction for t in self.open_trades}
-            if signal.direction not in existing_dirs:
-                trade = self._open_trade(signal.direction, price, timestamp, wallet)
-                if trade:
-                    new_trades.append(trade)
-
+        if signal.direction and signal.strength in ("STRONG", "MODERATE") and self._can_open():
+            existing = {t.direction for t in self.open_trades}
+            if signal.direction not in existing:
+                t = self._open_trade(signal.direction, price, ts, wallet)
+                if t:
+                    new_trades.append(t)
         return new_trades, closed, signal
 
-    def get_open_pnl(self, current_price: float) -> float:
-        return sum(t.compute_pnl(current_price) for t in self.open_trades)
+    def get_open_pnl(self, price):
+        return sum(t.compute_pnl(price) for t in self.open_trades)
 
-    def get_total_realised_pnl(self) -> float:
+    def get_total_realised_pnl(self):
         return sum(t.pnl for t in self.closed_trades)
 
-    def force_close_all(self, price: float, timestamp):
-        """Force-close all open positions at end of simulation."""
-        for trade in list(self.open_trades):
-            trade.close(price, timestamp, "eod_close")
-            self.closed_trades.append(trade)
+    def force_close_all(self, price, ts):
+        for t in list(self.open_trades):
+            t.close(price, ts, "eod_close")
+            self.closed_trades.append(t)
         self.open_trades.clear()
