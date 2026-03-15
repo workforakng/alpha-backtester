@@ -25,30 +25,51 @@ sim_state = {
     "ticker_stats":  {},
     "start_time":    None,
     "thread":        None,
+    "speed":         1,       # ticks emitted per eventlet yield (1=normal, 10=fast, 100=turbo)
+    "equity_curve":  [],      # [{t, v}] sampled every N ticks
+    "strategy_results": [],   # multi-wallet comparison results
 }
 
 
-def _reset_state():
+def _reset_state(initial_wallet):
     sim_state.update({
-        "running":      False,
-        "wallet":       INITIAL_WALLET,
-        "tick_count":   0,
-        "trade_log":    [],
-        "ticker_stats": {},
-        "start_time":   None,
+        "running":          False,
+        "wallet":           initial_wallet,
+        "tick_count":       0,
+        "trade_log":        [],
+        "ticker_stats":     {},
+        "start_time":       None,
+        "equity_curve":     [],
+        "strategy_results": [],
     })
 
 
-def _run_simulation(force_refresh=False):
-    _reset_state()
+STRATEGY_WALLETS = [50_000, 100_000, 200_000, 500_000]
+
+
+def _run_simulation(params):
+    force_refresh  = params.get("force_refresh", False)
+    custom_tickers = params.get("tickers", TICKERS)
+    initial_wallet = float(params.get("wallet", INITIAL_WALLET))
+    speed          = int(params.get("speed", 1))   # 1/10/50/100
+    period         = params.get("period", "5d")
+    interval       = params.get("interval", "1m")
+
+    sim_state["speed"] = speed
+    _reset_state(initial_wallet)
     sim_state["running"]    = True
     sim_state["start_time"] = time.time()
 
     socketio.emit("status", {"msg": "📡 Loading market data...", "type": "info"})
 
-    all_data = load_all_tickers(force_refresh=force_refresh)
+    all_data = load_all_tickers(
+        force_refresh=force_refresh,
+        tickers=custom_tickers,
+        period=period,
+        interval=interval,
+    )
     if not all_data:
-        socketio.emit("status", {"msg": "❌ No data loaded. Check tickers.", "type": "error"})
+        socketio.emit("status", {"msg": "❌ No data loaded. Check tickers/date range.", "type": "error"})
         sim_state["running"] = False
         return
 
@@ -61,17 +82,21 @@ def _run_simulation(force_refresh=False):
             "open_trades":   0,
             "closed_trades": 0,
             "last_signal":   "—",
+            "confluence_score": "—",
+            "signal_reasons":   [],
         }
 
     strategies     = {t: TickerStrategy(t, df) for t, df in all_data.items()}
     current_prices = {t: float(df["Close"].iloc[-1]) for t, df in all_data.items()}
-    wallet         = float(INITIAL_WALLET)
+    wallet         = float(initial_wallet)
 
     iterators = {t: iter(candle_stream(df, TICKS_PER_CANDLE)) for t, df in all_data.items()}
     active    = set(iterators.keys())
 
-    socketio.emit("status", {"msg": f"🚀 Simulation started — {len(strategies)} tickers", "type": "success"})
-    emit_every = max(1, TICKS_PER_CANDLE // 3)
+    socketio.emit("status", {"msg": f"🚀 Simulation started — {len(strategies)} tickers | speed x{speed}", "type": "success"})
+    emit_every    = max(1, TICKS_PER_CANDLE // 4)
+    equity_every  = TICKS_PER_CANDLE * 5
+    tick_batch    = 0
 
     while active and sim_state["running"]:
         for ticker in list(active):
@@ -100,9 +125,10 @@ def _run_simulation(force_refresh=False):
                     "pnl":       round(trade.pnl, 2),
                     "status":    trade.status,
                     "time":      str(trade.exit_time)[:16] if trade.exit_time else "—",
+                    "exit_reason": getattr(trade, 'exit_reason', '—'),
                 }
                 sim_state["trade_log"].insert(0, log_entry)
-                sim_state["trade_log"] = sim_state["trade_log"][:50]
+                sim_state["trade_log"] = sim_state["trade_log"][:100]
                 socketio.emit("new_trade", log_entry)
 
             # Update stats
@@ -113,29 +139,110 @@ def _run_simulation(force_refresh=False):
             stats["open_trades"]   = len(strat.open_trades)
             stats["closed_trades"] = len(strat.closed_trades)
             if signal and signal.direction:
-                stats["last_signal"] = f"{'▲' if signal.direction == 'CALL' else '▼'} {signal.direction} ({signal.score}/4)"
+                stats["last_signal"]      = f"{'▲' if signal.direction == 'CALL' else '▼'} {signal.direction} ({signal.score:.0f}/{signal.max_score:.0f})"
+                stats["confluence_score"] = f"{round(signal.score/signal.max_score*100)}%"
+                stats["signal_strength"]  = signal.strength
+                stats["signal_reasons"]   = signal.reasons[:8]
 
             sim_state["tick_count"] += 1
             sim_state["wallet"]      = wallet
+            tick_batch              += 1
 
-            if sim_state["tick_count"] % emit_every == 0:
-                _emit_dashboard(strategies, current_prices, wallet)
+            # equity curve sample
+            if sim_state["tick_count"] % equity_every == 0:
+                sim_state["equity_curve"].append({
+                    "t": sim_state["tick_count"],
+                    "v": round(wallet, 2)
+                })
 
-        eventlet_sleep()
+            if tick_batch >= speed:
+                tick_batch = 0
+                if sim_state["tick_count"] % emit_every == 0:
+                    _emit_dashboard(strategies, current_prices, wallet, initial_wallet)
+                import eventlet; eventlet.sleep(0)
 
     # Force close all on end
     for ticker, strat in strategies.items():
         strat.force_close_all(current_prices.get(ticker, 0), pd.Timestamp.now(tz="UTC"))
-        wallet += strat.get_total_realised_pnl()
+
+    # Recalculate wallet from all realised PnL
+    total_realised = sum(t.pnl for s in strategies.values() for t in s.closed_trades)
+    wallet = initial_wallet + total_realised
 
     sim_state["running"] = False
     sim_state["wallet"]  = wallet
-    _emit_dashboard(strategies, current_prices, wallet)
+    sim_state["equity_curve"].append({"t": sim_state["tick_count"], "v": round(wallet, 2)})
+    _emit_dashboard(strategies, current_prices, wallet, initial_wallet)
     socketio.emit("status", {"msg": "✅ Simulation complete!", "type": "success"})
-    socketio.emit("sim_done", _build_summary(strategies))
+
+    summary = _build_summary(strategies, initial_wallet)
+    summary["equity_curve"] = sim_state["equity_curve"]
+    socketio.emit("sim_done", summary)
 
 
-def _emit_dashboard(strategies, current_prices, wallet):
+def _run_multi_wallet_comparison(params):
+    """Run simulation with multiple wallet sizes and compare results."""
+    results = []
+    custom_tickers = params.get("tickers", TICKERS)
+    period   = params.get("period", "5d")
+    interval = params.get("interval", "1m")
+
+    all_data = load_all_tickers(force_refresh=False, tickers=custom_tickers,
+                                period=period, interval=interval)
+    if not all_data:
+        socketio.emit("status", {"msg": "❌ No data for comparison.", "type": "error"})
+        return
+
+    socketio.emit("status", {"msg": "🔬 Running multi-wallet strategy comparison...", "type": "info"})
+
+    for wallet_size in STRATEGY_WALLETS:
+        strategies = {t: TickerStrategy(t, df) for t, df in all_data.items()}
+        current_prices = {t: float(df["Close"].iloc[-1]) for t, df in all_data.items()}
+        wallet = float(wallet_size)
+        iterators = {t: iter(candle_stream(df, TICKS_PER_CANDLE)) for t, df in all_data.items()}
+        active = set(iterators.keys())
+
+        while active:
+            for ticker in list(active):
+                try:
+                    ts, price, candle_idx = next(iterators[ticker])
+                except StopIteration:
+                    strategies[ticker].force_close_all(current_prices.get(ticker, 0),
+                                                       pd.Timestamp.now(tz="UTC"))
+                    active.discard(ticker)
+                    continue
+                current_prices[ticker] = price
+                strat = strategies[ticker]
+                new_t, closed_t, signal = strat.process_tick(ts, price, candle_idx, wallet)
+                for t in new_t: wallet -= t.cost_basis()
+                for t in closed_t: wallet += t.cost_basis() + t.pnl
+            import eventlet; eventlet.sleep(0)
+
+        for ticker, strat in strategies.items():
+            strat.force_close_all(current_prices.get(ticker, 0), pd.Timestamp.now(tz="UTC"))
+
+        all_closed = [t for s in strategies.values() for t in s.closed_trades]
+        wins = [t for t in all_closed if t.status == "WIN"]
+        total_pnl = sum(t.pnl for t in all_closed)
+        final_wallet = wallet_size + total_pnl
+
+        results.append({
+            "wallet":       wallet_size,
+            "final":        round(final_wallet, 2),
+            "net_pnl":      round(total_pnl, 2),
+            "pct":          round((total_pnl / wallet_size) * 100, 2),
+            "trades":       len(all_closed),
+            "win_rate":     round(len(wins) / max(len(all_closed), 1) * 100, 1),
+            "profitable":   total_pnl > 0,
+        })
+        socketio.emit("status", {"msg": f"  ✓ ₹{wallet_size:,.0f} wallet done — P&L: {'+' if total_pnl>=0 else ''}₹{total_pnl:,.0f}", "type": "info"})
+
+    sim_state["strategy_results"] = results
+    socketio.emit("comparison_done", results)
+    socketio.emit("status", {"msg": "🏆 Strategy comparison complete!", "type": "success"})
+
+
+def _emit_dashboard(strategies, current_prices, wallet, initial_wallet):
     all_closed = [t for s in strategies.values() for t in s.closed_trades]
     wins       = [t for t in all_closed if t.status == "WIN"]
     total_pnl  = sum(t.pnl for t in all_closed)
@@ -143,43 +250,44 @@ def _emit_dashboard(strategies, current_prices, wallet):
     elapsed    = round(time.time() - sim_state["start_time"], 1) if sim_state["start_time"] else 0
 
     socketio.emit("dashboard_update", {
-        "wallet":       round(wallet, 2),
-        "net_pnl":      round(total_pnl + open_pnl, 2),
-        "realised_pnl": round(total_pnl, 2),
-        "open_pnl":     round(open_pnl, 2),
-        "wallet_pct":   round(((wallet - INITIAL_WALLET) / INITIAL_WALLET) * 100, 2),
-        "tick_count":   sim_state["tick_count"],
-        "win_rate":     round(len(wins) / max(len(all_closed), 1) * 100, 1),
-        "total_trades": len(all_closed),
-        "elapsed":      elapsed,
-        "ticker_stats": sim_state["ticker_stats"],
+        "wallet":        round(wallet, 2),
+        "initial_wallet": initial_wallet,
+        "net_pnl":       round(total_pnl + open_pnl, 2),
+        "realised_pnl":  round(total_pnl, 2),
+        "open_pnl":      round(open_pnl, 2),
+        "wallet_pct":    round(((wallet - initial_wallet) / initial_wallet) * 100, 2),
+        "tick_count":    sim_state["tick_count"],
+        "win_rate":      round(len(wins) / max(len(all_closed), 1) * 100, 1),
+        "total_trades":  len(all_closed),
+        "elapsed":       elapsed,
+        "ticker_stats":  sim_state["ticker_stats"],
     })
 
 
-def _build_summary(strategies):
+def _build_summary(strategies, initial_wallet):
     all_closed = [t for s in strategies.values() for t in s.closed_trades]
     wins   = [t for t in all_closed if t.status == "WIN"]
     losses = [t for t in all_closed if t.status in ("LOSS", "STOPPED")]
     return {
-        "total":    len(all_closed),
-        "wins":     len(wins),
-        "losses":   len(losses),
-        "net_pnl":  round(sum(t.pnl for t in all_closed), 2),
-        "win_rate": round(len(wins) / max(len(all_closed), 1) * 100, 1),
-        "avg_win":  round(np.mean([t.pnl for t in wins]) if wins else 0, 2),
-        "avg_loss": round(np.mean([t.pnl for t in losses]) if losses else 0, 2),
+        "total":          len(all_closed),
+        "wins":           len(wins),
+        "losses":         len(losses),
+        "net_pnl":        round(sum(t.pnl for t in all_closed), 2),
+        "win_rate":       round(len(wins) / max(len(all_closed), 1) * 100, 1),
+        "avg_win":        round(np.mean([t.pnl for t in wins])   if wins   else 0, 2),
+        "avg_loss":       round(np.mean([t.pnl for t in losses]) if losses else 0, 2),
+        "initial_wallet": initial_wallet,
+        "best_trade":     round(max((t.pnl for t in all_closed), default=0), 2),
+        "worst_trade":    round(min((t.pnl for t in all_closed), default=0), 2),
     }
-
-
-def eventlet_sleep():
-    import eventlet
-    eventlet.sleep(0)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template("index.html", tickers=TICKERS, initial_wallet=INITIAL_WALLET)
+    return render_template("index.html",
+                           tickers=TICKERS,
+                           initial_wallet=INITIAL_WALLET)
 
 @app.route("/api/status")
 def api_status():
@@ -192,8 +300,7 @@ def handle_start(data):
     if sim_state["running"]:
         emit("status", {"msg": "⚠️ Simulation already running.", "type": "warning"})
         return
-    force = data.get("force_refresh", False)
-    t = threading.Thread(target=_run_simulation, args=(force,), daemon=True)
+    t = threading.Thread(target=_run_simulation, args=(data,), daemon=True)
     sim_state["thread"] = t
     t.start()
 
@@ -207,16 +314,25 @@ def handle_clear():
     clear_old_data()
     emit("status", {"msg": "🗑️ Cache cleared.", "type": "info"})
 
+@socketio.on("run_comparison")
+def handle_comparison(data):
+    if sim_state["running"]:
+        emit("status", {"msg": "⚠️ Stop current simulation first.", "type": "warning"})
+        return
+    t = threading.Thread(target=_run_multi_wallet_comparison, args=(data,), daemon=True)
+    t.start()
+
 @socketio.on("connect")
 def handle_connect():
     emit("status", {"msg": "🔌 Connected to Alpha Backtester.", "type": "success"})
     if sim_state["ticker_stats"]:
         emit("dashboard_update", {
-            "wallet":       round(sim_state["wallet"], 2),
-            "net_pnl":      0, "realised_pnl": 0, "open_pnl": 0,
-            "wallet_pct":   0, "tick_count":   sim_state["tick_count"],
-            "win_rate":     0, "total_trades": 0, "elapsed": 0,
-            "ticker_stats": sim_state["ticker_stats"],
+            "wallet":         round(sim_state["wallet"], 2),
+            "initial_wallet": INITIAL_WALLET,
+            "net_pnl":        0, "realised_pnl": 0, "open_pnl": 0,
+            "wallet_pct":     0, "tick_count":   sim_state["tick_count"],
+            "win_rate":       0, "total_trades": 0, "elapsed": 0,
+            "ticker_stats":   sim_state["ticker_stats"],
         })
 
 
